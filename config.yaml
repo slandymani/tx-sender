@@ -1,0 +1,6 @@
+ethereum:
+  mnemonic: ""
+  rpc: ""
+  addresses_number: "1000"
+  max_amount_to_send: "500000000000000000"
+  requests_number: "2000"
