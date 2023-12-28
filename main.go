@@ -5,6 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"fmt"
+	"math/big"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -14,8 +19,6 @@ import (
 	"github.com/fbsobreira/gotron-sdk/pkg/keys/hd"
 	"github.com/tyler-smith/go-bip39"
 	"gitlab.com/distributed_lab/logan/v3/errors"
-	"math/big"
-	"time"
 )
 
 type Account struct {
@@ -23,6 +26,7 @@ type Account struct {
 	Pk      *ecdsa.PublicKey
 	Address common.Address
 	Balance *big.Int
+	Nonce   *uint64
 }
 
 func FromMnemonicSeed(mnemonic string, index int) (*btcec.PrivateKey, *btcec.PublicKey) {
@@ -89,16 +93,11 @@ func main() {
 	}
 	defer client.Close()
 
-	//masterSK, masterPK := FromMnemonicSeed(config.Mnemonic, 0)
-	//fmt.Println(masterSK.ToECDSA())
-	//fmt.Println(masterPK.ToECDSA())
-	//
-	//fmt.Println(crypto.PubkeyToAddress(*masterPK.ToECDSA()).String())
-
 	accounts := make(map[int]Account)
 
 	fmt.Println("Start generating addresses and getting balances")
 	now := time.Now()
+	var wg sync.WaitGroup
 
 	for i := 0; i < config.AddressesNumber; i++ {
 		sk, pk := FromMnemonicSeed(config.Mnemonic, i)
@@ -125,8 +124,6 @@ func main() {
 		//fmt.Println(address.String())
 	}
 
-	//accounts[0].Balance.Add(accounts[0].Balance, big.NewInt(10000))
-
 	fmt.Println(time.Since(now))
 
 	fmt.Println("Finish generating addresses and getting balances")
@@ -149,39 +146,46 @@ func main() {
 			sentPrev = sent
 		}
 
-		if sent%50 == 0 {
+		if sent%15 == 0 {
 			gasPrice, _ = client.SuggestGasPrice(context.Background())
-			gasPrice.Mul(gasPrice, big.NewInt(6))
-			gasPrice.Quo(gasPrice, big.NewInt(5))
 		}
 
-		gas := new(big.Int).Mul(gasPrice, big.NewInt(21000))
-		gas.Mul(gas, big.NewInt(6))
-		gas.Quo(gas, big.NewInt(5))
-		randAdd, err := rand.Int(rand.Reader, big.NewInt(2000))
+		randGasPrice := new(big.Int).Set(gasPrice)
+		randAdd, err := rand.Int(rand.Reader, big.NewInt(2000000000))
 		if err == nil {
-			gas.Add(gas, randAdd)
+			randGasPrice.Add(gasPrice, randAdd)
 		}
+
+		gas := new(big.Int).Mul(randGasPrice, big.NewInt(21000))
 
 		sender, receiver, amount, err := GetSenderReceiver(accounts, sendLimit, gas)
 		if err != nil {
-			//fmt.Println(err)
+			//fmt.Println(errors.Wrap(err, "failed to receive sender and receiver for tx"))
 			continue
 		}
 
 		fmt.Println(accounts[sender].Address.String(), " -> ", accounts[receiver].Address.String(), " - ", amount.String())
 
-		nonce, err := client.PendingNonceAt(context.Background(), accounts[sender].Address)
-		if err != nil {
-			fmt.Println(err)
-			continue
+		var nonce uint64
+		if accounts[sender].Nonce != nil {
+			nonce = *accounts[sender].Nonce
+		} else {
+			nonce, err = client.PendingNonceAt(context.Background(), accounts[sender].Address)
+			if err != nil {
+				fmt.Println(err)
+				continue
+			}
+
+			senderVal := accounts[sender]
+			senderVal.Nonce = &nonce
+			accounts[sender] = senderVal
 		}
 
 		receiverAddr := accounts[receiver].Address
 
 		tx := types.NewTx(&types.LegacyTx{
 			Nonce:    nonce,
-			GasPrice: gasPrice,
+			GasPrice: randGasPrice,
 			Gas:      uint64(21000),
 			To:       &receiverAddr,
 			Value:    amount,
@@ -200,25 +204,42 @@ func main() {
 			continue
 		}
 		fmt.Println(tx.Hash().String())
-		receipt, err := bind.WaitMined(context.Background(), client, tx)
-		if err != nil {
-			fmt.Println(err)
-			continue
-		}
-		fmt.Println(receipt.BlockNumber.Int64())
+		go func(tx *types.Transaction, num int) {
+			wg.Add(1)
+			defer wg.Done()
+			receipt, err := bind.WaitMined(context.Background(), client, tx)
+			if err != nil {
+				fmt.Printf("%d failed tx wait mined %s\n", num, tx.Hash())
+				fmt.Println(err)
+				return
+			}
+			fmt.Printf("%d tx wait mined %s block: %d\n", num, tx.Hash(), receipt.BlockNumber.Int64())
+		}(tx, sent)
 
 		accounts[receiver].Balance.Add(accounts[receiver].Balance, amount)
 		accounts[sender].Balance.Sub(accounts[sender].Balance, amount)
 		accounts[sender].Balance.Sub(accounts[sender].Balance, gas)
+		atomic.AddUint64(accounts[sender].Nonce, 1)
 		sent++
-	}
-	sum := big.NewInt(0)
-	for _, account := range accounts {
-		sum.Add(sum, account.Balance)
-	}
-	fmt.Println(sum.Int64())
 
+		randDelay := new(big.Int)
+		randDelay, err = rand.Int(rand.Reader, big.NewInt(7500))
+		if err != nil {
+			randDelay = big.NewInt(3000)
+		}
+		randDelay.Add(randDelay, big.NewInt(2000))
+		time.Sleep(time.Duration(randDelay.Int64() * int64(time.Millisecond)))
+	}
+	//sum := big.NewInt(0)
+	//for _, account := range accounts {
+	//	sum.Add(sum, account.Balance)
+	//}
+	//fmt.Println(sum.Int64())
+
+	fmt.Println(now)
 	fmt.Println(time.Since(now))
 
 	fmt.Println("Finish sending txs")
+	wg.Wait()
+
 }

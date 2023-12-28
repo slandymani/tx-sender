@@ -1,9 +1,10 @@
 package main
 
 import (
+	"math/big"
+
 	"gitlab.com/distributed_lab/figure/v3"
 	"gitlab.com/distributed_lab/kit/kv"
-	"math/big"
 )
 
 type EthConfig struct {
